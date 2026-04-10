@@ -383,56 +383,33 @@ with tab_convert:
 with tab_history:
     col_title, col_refresh = st.columns([4, 1])
     with col_title:
-        st.subheader("変換履歴")
+        st.subheader("変換履歴（最新5件）")
     with col_refresh:
         if st.button("更新", use_container_width=True):
             st.rerun()
 
     try:
-        history = fetch_history(100)
+        history = fetch_history(5)
     except Exception as e:
         st.error(f"履歴の取得に失敗しました: {e}")
         history = []
 
     if not history:
-        st.info("まだ履歴がありません。変換タブでファイルをアップロードしてみてください。")
+        st.info("まだ履歴がありません。")
     else:
-        options = {
-            # 長いURL等は表示時に切り詰め
-            f"{(h['filename'] or '')[:80]}  —  {h['created_at'][:19].replace('T', ' ')}": h
-            for h in history
-        }
-        selected_label = st.selectbox(
-            f"履歴（全{len(history)}件、新しい順）",
-            list(options.keys()),
-        )
-        item = options[selected_label]
+        for item in history:
+            filename = item.get("filename") or ""
+            display_name = filename if len(filename) <= 60 else filename[:60] + "…"
+            executed_at = item["created_at"][:19].replace("T", " ")
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("サイズ", f"{(item.get('file_size') or 0):,} B")
-        c2.metric("タイプ", item.get("file_type") or "-")
-        c3.metric("文字数", f"{(item.get('char_count') or 0):,}")
-        c4.metric("日付", item["created_at"][:10])
-
-        # URLやファイル名のフル表示
-        st.caption(f"元: `{item['filename']}`")
-
-        st.download_button(
-            label="このMarkdownをダウンロード",
-            data=item.get("markdown") or "",
-            file_name=safe_download_name(item["filename"]),
-            mime="text/markdown",
-            key=f"dl_{item['id']}",
-        )
-
-        h_raw, h_rendered = st.tabs(["Markdown（生）", "プレビュー"])
-        with h_raw:
-            st.text_area(
-                "Markdown",
-                item.get("markdown") or "",
-                height=500,
-                label_visibility="collapsed",
-                key=f"ta_{item['id']}",
-            )
-        with h_rendered:
-            st.markdown(item.get("markdown") or "")
+            with st.expander(f"{display_name}   —   {executed_at}"):
+                st.markdown(f"**入力**: `{filename}`")
+                st.markdown("**出力**:")
+                st.markdown(item.get("markdown") or "_（空）_")
+                st.download_button(
+                    label="ダウンロード",
+                    data=item.get("markdown") or "",
+                    file_name=safe_download_name(filename),
+                    mime="text/markdown",
+                    key=f"dl_{item['id']}",
+                )
