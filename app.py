@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import tempfile
 from datetime import datetime
@@ -23,6 +24,9 @@ AV_EXTENSIONS = VIDEO_EXTENSIONS | AUDIO_EXTENSIONS
 # Whisper API のファイルサイズ上限は 25MB。安全マージンを取って 24MB。
 WHISPER_MAX_BYTES = 24 * 1024 * 1024
 
+# 画像キャプション用に使うOpenAIモデル（ビジョン対応・低コスト）
+VISION_MODEL = "gpt-4o-mini"
+
 
 # ============================================
 # Supabase クライアント
@@ -42,6 +46,15 @@ def get_supabase() -> Client:
 def get_openai() -> OpenAI:
     """OpenAIクライアントを生成してキャッシュ"""
     return OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+
+# ============================================
+# MarkItDown クライアント
+# ============================================
+@st.cache_resource
+def get_markitdown() -> MarkItDown:
+    """MarkItDownインスタンスを生成。画像キャプション生成のためにOpenAIクライアントを渡す。"""
+    return MarkItDown(llm_client=get_openai(), llm_model=VISION_MODEL)
 
 
 # ============================================
@@ -171,10 +184,79 @@ def transcribe_with_whisper(file_path: str, original_name: str) -> str:
 
 
 # ============================================
+# 共通ユーティリティ
+# ============================================
+def safe_download_name(name: str) -> str:
+    """ダウンロードファイル名として安全な文字列に変換"""
+    stem = os.path.splitext(name)[0]
+    stem = re.sub(r"https?://", "", stem)
+    stem = re.sub(r"[^\w\-.]", "_", stem)
+    stem = stem.strip("_") or "conversion"
+    return stem[:100] + ".md"
+
+
+def render_conversion_result(
+    md_text: str,
+    filename: str,
+    file_size: int,
+    file_type: str,
+    original_bytes: Optional[bytes] = None,
+    save_original: bool = False,
+    converter_label: str = "MarkItDown",
+) -> None:
+    """変換結果を Storage/DB に保存して、ダウンロードボタンとプレビューを表示する共通処理"""
+    st.success(f"変換が完了しました（{converter_label}）")
+
+    # 元ファイルをStorageへ（任意・ファイルアップロード時のみ）
+    storage_key: Optional[str] = None
+    if save_original and original_bytes is not None:
+        try:
+            with st.spinner("元ファイルをStorageに保存中..."):
+                storage_key = upload_to_storage(original_bytes, filename)
+        except Exception as e:
+            st.warning(f"Storageへの保存に失敗しました: {e}")
+
+    # DBに履歴保存
+    try:
+        save_history(
+            filename=filename,
+            file_size=file_size,
+            file_type=file_type,
+            markdown=md_text,
+            storage_key=storage_key,
+        )
+    except Exception as e:
+        st.warning(f"履歴の保存に失敗しました: {e}")
+
+    # ダウンロードボタン
+    st.download_button(
+        label="Markdownをダウンロード",
+        data=md_text,
+        file_name=safe_download_name(filename),
+        mime="text/markdown",
+    )
+
+    # プレビュー
+    sub_raw, sub_rendered = st.tabs(["Markdown（生）", "プレビュー"])
+    with sub_raw:
+        st.text_area(
+            "Markdown",
+            md_text,
+            height=500,
+            label_visibility="collapsed",
+        )
+    with sub_rendered:
+        st.markdown(md_text)
+
+
+# ============================================
 # UI
 # ============================================
 st.title("MarkItDown GUI")
-st.caption("ドキュメントは MarkItDown、音声・動画は OpenAI Whisper で変換 + 履歴をSupabaseに保存")
+st.caption(
+    "ドキュメント・画像は MarkItDown (+ OpenAI Vision)、"
+    "音声・動画は Whisper、YouTube/Web は URL から直接変換。履歴はSupabaseに保存。"
+)
 
 tab_convert, tab_history = st.tabs(["変換", "履歴"])
 
@@ -182,87 +264,103 @@ tab_convert, tab_history = st.tabs(["変換", "履歴"])
 # 変換タブ
 # --------------------------------------------
 with tab_convert:
-    uploaded = st.file_uploader(
-        "ファイルを選択（PDF / Word / Excel / PowerPoint / 画像 / 音声 / 動画 など）",
-        type=None,
-    )
-    save_original = st.checkbox(
-        "元ファイルもStorageに保存する（Supabase Storage 上限1GBに注意）",
-        value=False,
+    input_mode = st.radio(
+        "入力方式を選択",
+        ["ファイル", "URL（YouTube / Web）"],
+        horizontal=True,
     )
 
-    if uploaded is not None:
-        suffix = os.path.splitext(uploaded.name)[1]
-        file_bytes = uploaded.getvalue()
+    # ============ ファイルアップロード ============
+    if input_mode == "ファイル":
+        st.markdown(
+            "**対応フォーマット**: Word / Excel / PowerPoint / PDF / HTML / "
+            "JSON / XML / CSV / ZIP / 画像 (OCR+キャプション) / 音声 / 動画"
+        )
+        uploaded = st.file_uploader(
+            "ファイルを選択",
+            type=None,
+        )
+        save_original = st.checkbox(
+            "元ファイルもStorageに保存する（Supabase Storage 上限1GBに注意）",
+            value=False,
+        )
 
-        with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
-            tmp.write(file_bytes)
-            tmp_path = tmp.name
+        if uploaded is not None:
+            suffix = os.path.splitext(uploaded.name)[1]
+            file_bytes = uploaded.getvalue()
 
-        try:
-            # ファイルタイプに応じて変換方法を切り替え
-            if is_audio_or_video(uploaded.name):
-                with st.spinner("Whisper APIで文字起こし中..."):
-                    md_text = transcribe_with_whisper(tmp_path, uploaded.name)
-                converter_label = "Whisper"
-            else:
-                with st.spinner("MarkItDownで変換中..."):
-                    result = MarkItDown().convert(tmp_path)
-                    md_text = result.text_content
-                converter_label = "MarkItDown"
+            with tempfile.NamedTemporaryFile(delete=False, suffix=suffix) as tmp:
+                tmp.write(file_bytes)
+                tmp_path = tmp.name
 
-            st.success(f"変換が完了しました（{converter_label}）")
-
-            # 元ファイルをStorageへ（任意）
-            storage_key: Optional[str] = None
-            if save_original:
-                try:
-                    with st.spinner("元ファイルをStorageに保存中..."):
-                        storage_key = upload_to_storage(file_bytes, uploaded.name)
-                except Exception as e:
-                    st.warning(f"Storageへの保存に失敗しました: {e}")
-
-            # DBに履歴保存
             try:
-                save_history(
+                # ファイルタイプに応じて変換方法を切り替え
+                if is_audio_or_video(uploaded.name):
+                    with st.spinner("Whisper APIで文字起こし中..."):
+                        md_text = transcribe_with_whisper(tmp_path, uploaded.name)
+                    converter_label = "Whisper"
+                else:
+                    with st.spinner("MarkItDownで変換中..."):
+                        result = get_markitdown().convert(tmp_path)
+                        md_text = result.text_content
+                    converter_label = "MarkItDown"
+
+                render_conversion_result(
+                    md_text=md_text,
                     filename=uploaded.name,
                     file_size=len(file_bytes),
                     file_type=suffix.lstrip(".").lower() or "unknown",
-                    markdown=md_text,
-                    storage_key=storage_key,
+                    original_bytes=file_bytes,
+                    save_original=save_original,
+                    converter_label=converter_label,
                 )
+
+            except subprocess.CalledProcessError as e:
+                err = e.stderr.decode(errors="ignore")[:500] if e.stderr else str(e)
+                st.error(f"ffmpeg 実行に失敗しました: {err}")
             except Exception as e:
-                st.warning(f"履歴の保存に失敗しました: {e}")
+                st.error(f"変換に失敗しました: {e}")
+            finally:
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
 
-            # ダウンロードボタン
-            st.download_button(
-                label="Markdownをダウンロード",
-                data=md_text,
-                file_name=os.path.splitext(uploaded.name)[0] + ".md",
-                mime="text/markdown",
-            )
+    # ============ URL入力 ============
+    else:
+        st.markdown(
+            "**対応URL例**: YouTube動画（字幕抽出）、Wikipediaなどの一般Webページ（HTML→Markdown）"
+        )
+        url = st.text_input(
+            "URLを入力",
+            placeholder="https://www.youtube.com/watch?v=... または https://example.com/...",
+        )
 
-            # プレビュー
-            sub_raw, sub_rendered = st.tabs(["Markdown（生）", "プレビュー"])
-            with sub_raw:
-                st.text_area(
-                    "Markdown",
-                    md_text,
-                    height=500,
-                    label_visibility="collapsed",
-                )
-            with sub_rendered:
-                st.markdown(md_text)
-
-        except subprocess.CalledProcessError as e:
-            st.error(f"ffmpeg 実行に失敗しました: {e.stderr.decode(errors='ignore')[:500] if e.stderr else e}")
-        except Exception as e:
-            st.error(f"変換に失敗しました: {e}")
-        finally:
+        if st.button("変換", type="primary", disabled=not url):
             try:
-                os.unlink(tmp_path)
-            except OSError:
-                pass
+                with st.spinner("URLの内容を取得・変換中..."):
+                    result = get_markitdown().convert(url.strip())
+                    md_text = result.text_content
+
+                # URLからファイルタイプを推定
+                url_lower = url.lower()
+                if "youtube.com" in url_lower or "youtu.be" in url_lower:
+                    file_type = "youtube"
+                else:
+                    file_type = "url"
+
+                render_conversion_result(
+                    md_text=md_text,
+                    filename=url.strip(),
+                    file_size=0,
+                    file_type=file_type,
+                    original_bytes=None,
+                    save_original=False,
+                    converter_label="MarkItDown (URL)",
+                )
+
+            except Exception as e:
+                st.error(f"変換に失敗しました: {e}")
 
 # --------------------------------------------
 # 履歴タブ
@@ -285,7 +383,8 @@ with tab_history:
         st.info("まだ履歴がありません。変換タブでファイルをアップロードしてみてください。")
     else:
         options = {
-            f"{h['filename']}  —  {h['created_at'][:19].replace('T', ' ')}": h
+            # 長いURL等は表示時に切り詰め
+            f"{(h['filename'] or '')[:80]}  —  {h['created_at'][:19].replace('T', ' ')}": h
             for h in history
         }
         selected_label = st.selectbox(
@@ -296,14 +395,17 @@ with tab_history:
 
         c1, c2, c3, c4 = st.columns(4)
         c1.metric("サイズ", f"{(item.get('file_size') or 0):,} B")
-        c2.metric("拡張子", item.get("file_type") or "-")
+        c2.metric("タイプ", item.get("file_type") or "-")
         c3.metric("文字数", f"{(item.get('char_count') or 0):,}")
         c4.metric("日付", item["created_at"][:10])
+
+        # URLやファイル名のフル表示
+        st.caption(f"元: `{item['filename']}`")
 
         st.download_button(
             label="このMarkdownをダウンロード",
             data=item.get("markdown") or "",
-            file_name=os.path.splitext(item["filename"])[0] + ".md",
+            file_name=safe_download_name(item["filename"]),
             mime="text/markdown",
             key=f"dl_{item['id']}",
         )
