@@ -5,6 +5,7 @@ import tempfile
 from datetime import datetime
 from typing import Optional
 
+import anthropic
 import streamlit as st
 from markitdown import MarkItDown
 from openai import OpenAI
@@ -26,6 +27,9 @@ WHISPER_MAX_BYTES = 24 * 1024 * 1024
 
 # 画像キャプション用に使うOpenAIモデル（ビジョン対応・低コスト）
 VISION_MODEL = "gpt-4o-mini"
+
+# Markdown構造整形に使うClaudeモデル（安価で高速）
+REFINE_MODEL = "claude-haiku-4-5-20251001"
 
 
 # ============================================
@@ -55,6 +59,49 @@ def get_openai() -> OpenAI:
 def get_markitdown() -> MarkItDown:
     """MarkItDownインスタンスを生成。画像キャプション生成のためにOpenAIクライアントを渡す。"""
     return MarkItDown(llm_client=get_openai(), llm_model=VISION_MODEL)
+
+
+# ============================================
+# Anthropic (Claude) クライアント
+# ============================================
+@st.cache_resource
+def get_anthropic() -> anthropic.Anthropic:
+    """Anthropicクライアントを生成してキャッシュ"""
+    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+
+
+def refine_with_claude(markdown: str) -> str:
+    """Claude Haikuで生のMarkdownを構造化・整形する。元の情報は変えない。"""
+    client = get_anthropic()
+
+    prompt = (
+        "以下のテキストは文書から抽出された生のMarkdownまたはプレーンテキストです。"
+        "元の情報を省略・要約・追加せずに、読みやすい構造化Markdownに整形してください。\n\n"
+        "【整形ルール】\n"
+        "- 適切な見出し階層（#, ##, ###）を付ける\n"
+        "- 箇条書き・番号リストを適切に使う\n"
+        "- 表形式のデータはMarkdown表にする\n"
+        "- コードやコマンドはコードブロックにする\n"
+        "- 明らかな誤字・改行崩れは修正してよい\n"
+        "- 内容そのものは変えない\n"
+        "- 整形後のMarkdownだけを返す。前置きや説明、コードフェンスの ```markdown は不要\n\n"
+        "【元テキスト】\n"
+        f"{markdown}\n"
+    )
+
+    response = client.messages.create(
+        model=REFINE_MODEL,
+        max_tokens=16000,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    # レスポンスのテキスト部分を連結
+    parts = []
+    for block in response.content:
+        if hasattr(block, "text"):
+            parts.append(block.text)
+    refined = "".join(parts).strip()
+    return refined or markdown
 
 
 # ============================================
@@ -301,6 +348,11 @@ with tab_convert:
             "元ファイルもStorageに保存する（Supabase Storage 上限1GBに注意）",
             value=False,
         )
+        refine_with_ai = st.checkbox(
+            "Claudeで構造を整える（Haikuで見出し・リスト・表に整形）",
+            value=False,
+            key="refine_file",
+        )
 
         if uploaded is not None:
             suffix = os.path.splitext(uploaded.name)[1]
@@ -321,6 +373,15 @@ with tab_convert:
                         result = get_markitdown().convert(tmp_path)
                         md_text = result.text_content
                     converter_label = "MarkItDown"
+
+                # Claudeで構造整形（オプション）
+                if refine_with_ai:
+                    try:
+                        with st.spinner("Claudeで構造整形中..."):
+                            md_text = refine_with_claude(md_text)
+                        converter_label += " + Claude整形"
+                    except Exception as e:
+                        st.warning(f"Claude整形に失敗しました（未整形の結果を表示します）: {e}")
 
                 render_conversion_result(
                     md_text=md_text,
