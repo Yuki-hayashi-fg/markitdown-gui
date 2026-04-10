@@ -2,4 +2,4 @@ streamlit
 markitdown[all]
 supabase
 openai
-anthropic
+google-genai

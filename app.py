@@ -5,8 +5,9 @@ import tempfile
 from datetime import datetime
 from typing import Optional
 
-import anthropic
 import streamlit as st
+from google import genai
+from google.genai import types as genai_types
 from markitdown import MarkItDown
 from openai import OpenAI
 from supabase import Client, create_client
@@ -28,8 +29,8 @@ WHISPER_MAX_BYTES = 24 * 1024 * 1024
 # 画像キャプション用に使うOpenAIモデル（ビジョン対応・低コスト）
 VISION_MODEL = "gpt-4o-mini"
 
-# Markdown構造整形に使うClaudeモデル（安価で高速）
-REFINE_MODEL = "claude-haiku-4-5-20251001"
+# Markdown構造整形に使うGeminiモデル（安価で高速）
+REFINE_MODEL = "gemini-2.5-flash"
 
 
 # ============================================
@@ -62,17 +63,17 @@ def get_markitdown() -> MarkItDown:
 
 
 # ============================================
-# Anthropic (Claude) クライアント
+# Google Gemini クライアント
 # ============================================
 @st.cache_resource
-def get_anthropic() -> anthropic.Anthropic:
-    """Anthropicクライアントを生成してキャッシュ"""
-    return anthropic.Anthropic(api_key=st.secrets["ANTHROPIC_API_KEY"])
+def get_gemini() -> genai.Client:
+    """Geminiクライアントを生成してキャッシュ"""
+    return genai.Client(api_key=st.secrets["GEMINI_API_KEY"])
 
 
-def refine_with_claude(markdown: str) -> str:
-    """Claude Haikuで生のMarkdownを構造化・整形する。元の情報は変えない。"""
-    client = get_anthropic()
+def refine_with_gemini(markdown: str) -> str:
+    """Gemini Flashで生のMarkdownを構造化・整形する。元の情報は変えない。"""
+    client = get_gemini()
 
     prompt = (
         "以下のテキストは文書から抽出された生のMarkdownまたはプレーンテキストです。"
@@ -89,18 +90,16 @@ def refine_with_claude(markdown: str) -> str:
         f"{markdown}\n"
     )
 
-    response = client.messages.create(
+    response = client.models.generate_content(
         model=REFINE_MODEL,
-        max_tokens=16000,
-        messages=[{"role": "user", "content": prompt}],
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            temperature=0.2,
+            max_output_tokens=16000,
+        ),
     )
 
-    # レスポンスのテキスト部分を連結
-    parts = []
-    for block in response.content:
-        if hasattr(block, "text"):
-            parts.append(block.text)
-    refined = "".join(parts).strip()
+    refined = (response.text or "").strip()
     return refined or markdown
 
 
@@ -359,9 +358,9 @@ with tab_convert:
                 key="opt_save_original",
             )
             refine_with_ai = st.checkbox(
-                "Claudeで構造を整える",
+                "Geminiで構造を整える",
                 value=False,
-                help="Claude Haiku で見出し・リスト・表に整形（情報は変えません）",
+                help="Gemini Flash で見出し・リスト・表に整形（情報は変えません）",
                 key="opt_refine_file",
             )
 
@@ -395,14 +394,14 @@ with tab_convert:
                         md_text = result.text_content
                     converter_label = "MarkItDown"
 
-                # Claudeで構造整形（オプション）
+                # Geminiで構造整形（オプション）
                 if refine_with_ai:
                     try:
-                        with st.spinner("Claudeで構造整形中..."):
-                            md_text = refine_with_claude(md_text)
-                        converter_label += " + Claude整形"
+                        with st.spinner("Geminiで構造整形中..."):
+                            md_text = refine_with_gemini(md_text)
+                        converter_label += " + Gemini整形"
                     except Exception as e:
-                        st.warning(f"Claude整形に失敗しました（未整形の結果を表示します）: {e}")
+                        st.warning(f"Gemini整形に失敗しました（未整形の結果を表示します）: {e}")
 
                 # 保存（1回だけ）
                 save_conversion(
