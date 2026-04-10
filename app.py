@@ -242,19 +242,15 @@ def safe_download_name(name: str) -> str:
     return stem[:100] + ".md"
 
 
-def render_conversion_result(
+def save_conversion(
     md_text: str,
     filename: str,
     file_size: int,
     file_type: str,
     original_bytes: Optional[bytes] = None,
     save_original: bool = False,
-    converter_label: str = "MarkItDown",
 ) -> None:
-    """変換結果を Storage/DB に保存して、ダウンロードボタンとプレビューを表示する共通処理"""
-    st.success(f"変換が完了しました（{converter_label}）")
-
-    # 元ファイルをStorageへ（任意・ファイルアップロード時のみ）
+    """Storage / DB への保存（変換ボタン押下時のみ 1回実行）"""
     storage_key: Optional[str] = None
     if save_original and original_bytes is not None:
         try:
@@ -263,7 +259,6 @@ def render_conversion_result(
         except Exception as e:
             st.warning(f"Storageへの保存に失敗しました: {e}")
 
-    # DBに履歴保存
     try:
         save_history(
             filename=filename,
@@ -275,15 +270,16 @@ def render_conversion_result(
     except Exception as e:
         st.warning(f"履歴の保存に失敗しました: {e}")
 
-    # ダウンロードボタン
+
+def display_conversion(md_text: str, filename: str, converter_label: str) -> None:
+    """変換結果の表示（リラン時にもセッション状態から呼ばれる）"""
+    st.success(f"変換完了（{converter_label}）")
     st.download_button(
         label="Markdownをダウンロード",
         data=md_text,
         file_name=safe_download_name(filename),
         mime="text/markdown",
     )
-
-    # プレビュー
     sub_raw, sub_rendered = st.tabs(["Markdown（生）", "プレビュー"])
     with sub_raw:
         st.text_area(
@@ -332,29 +328,55 @@ with tab_convert:
             """
         )
 
+    st.markdown("##### 入力方式")
     input_mode = st.radio(
-        "入力方式を選択",
+        "input_mode",
         ["ファイル", "URL（YouTube / Web）"],
         horizontal=True,
+        label_visibility="collapsed",
     )
+
+    st.write("")  # spacer
 
     # ============ ファイルアップロード ============
     if input_mode == "ファイル":
-        uploaded = st.file_uploader(
-            "ファイルを選択",
-            type=None,
-        )
-        save_original = st.checkbox(
-            "元ファイルもStorageに保存する（Supabase Storage 上限1GBに注意）",
-            value=False,
-        )
-        refine_with_ai = st.checkbox(
-            "Claudeで構造を整える（Haikuで見出し・リスト・表に整形）",
-            value=False,
-            key="refine_file",
+        # --- 入力 ---
+        with st.container(border=True):
+            st.markdown("##### ファイルを選択")
+            uploaded = st.file_uploader(
+                "file_uploader",
+                type=None,
+                label_visibility="collapsed",
+            )
+
+        # --- オプション ---
+        with st.container(border=True):
+            st.markdown("##### オプション")
+            save_original = st.checkbox(
+                "元ファイルもStorageに保存する",
+                value=False,
+                help="Supabase Storage 上限1GBに注意",
+                key="opt_save_original",
+            )
+            refine_with_ai = st.checkbox(
+                "Claudeで構造を整える",
+                value=False,
+                help="Claude Haiku で見出し・リスト・表に整形（情報は変えません）",
+                key="opt_refine_file",
+            )
+
+        st.write("")  # spacer
+
+        # --- 変換ボタン ---
+        convert_clicked = st.button(
+            "変換する",
+            type="primary",
+            disabled=(uploaded is None),
+            use_container_width=True,
+            key="btn_convert_file",
         )
 
-        if uploaded is not None:
+        if convert_clicked and uploaded is not None:
             suffix = os.path.splitext(uploaded.name)[1]
             file_bytes = uploaded.getvalue()
 
@@ -363,7 +385,6 @@ with tab_convert:
                 tmp_path = tmp.name
 
             try:
-                # ファイルタイプに応じて変換方法を切り替え
                 if is_audio_or_video(uploaded.name):
                     with st.spinner("Whisper APIで文字起こし中..."):
                         md_text = transcribe_with_whisper(tmp_path, uploaded.name)
@@ -383,60 +404,111 @@ with tab_convert:
                     except Exception as e:
                         st.warning(f"Claude整形に失敗しました（未整形の結果を表示します）: {e}")
 
-                render_conversion_result(
+                # 保存（1回だけ）
+                save_conversion(
                     md_text=md_text,
                     filename=uploaded.name,
                     file_size=len(file_bytes),
                     file_type=suffix.lstrip(".").lower() or "unknown",
                     original_bytes=file_bytes,
                     save_original=save_original,
-                    converter_label=converter_label,
                 )
+
+                # セッション状態に結果を保持（再実行時にも表示継続）
+                st.session_state.file_result = {
+                    "md_text": md_text,
+                    "filename": uploaded.name,
+                    "converter_label": converter_label,
+                }
 
             except subprocess.CalledProcessError as e:
                 err = e.stderr.decode(errors="ignore")[:500] if e.stderr else str(e)
                 st.error(f"ffmpeg 実行に失敗しました: {err}")
+                st.session_state.file_result = None
             except Exception as e:
                 st.error(f"変換に失敗しました: {e}")
+                st.session_state.file_result = None
             finally:
                 try:
                     os.unlink(tmp_path)
                 except OSError:
                     pass
 
+        # --- 結果 ---
+        file_result = st.session_state.get("file_result")
+        if file_result:
+            st.write("")
+            with st.container(border=True):
+                st.markdown("##### 変換結果")
+                display_conversion(
+                    md_text=file_result["md_text"],
+                    filename=file_result["filename"],
+                    converter_label=file_result["converter_label"],
+                )
+
     # ============ URL入力 ============
     else:
-        st.caption("YouTube動画（字幕抽出）、Wikipediaなどの一般Webページ（HTML→Markdown）")
-        url = st.text_input(
-            "URLを入力",
-            placeholder="https://www.youtube.com/watch?v=... または https://example.com/...",
+        # --- 入力 ---
+        with st.container(border=True):
+            st.markdown("##### URLを入力")
+            st.caption("YouTube動画（字幕抽出）、Wikipedia・一般Webページ（HTML→Markdown）")
+            url = st.text_input(
+                "url_input",
+                placeholder="https://www.youtube.com/watch?v=... または https://example.com/...",
+                label_visibility="collapsed",
+                key="url_input",
+            )
+
+        st.write("")  # spacer
+
+        # --- 変換ボタン ---
+        convert_url_clicked = st.button(
+            "変換する",
+            type="primary",
+            disabled=not url,
+            use_container_width=True,
+            key="btn_convert_url",
         )
 
-        if st.button("変換", type="primary", disabled=not url):
+        if convert_url_clicked:
             try:
                 with st.spinner("URLの内容を取得・変換中..."):
                     result = get_markitdown().convert(url.strip())
                     md_text = result.text_content
 
-                # URLからファイルタイプを推定
                 url_lower = url.lower()
-                if "youtube.com" in url_lower or "youtu.be" in url_lower:
-                    file_type = "youtube"
-                else:
-                    file_type = "url"
+                file_type = "youtube" if ("youtube.com" in url_lower or "youtu.be" in url_lower) else "url"
 
-                render_conversion_result(
+                save_conversion(
                     md_text=md_text,
                     filename=url.strip(),
                     file_size=0,
                     file_type=file_type,
                     original_bytes=None,
                     save_original=False,
-                    converter_label="MarkItDown (URL)",
                 )
+
+                st.session_state.url_result = {
+                    "md_text": md_text,
+                    "filename": url.strip(),
+                    "converter_label": "MarkItDown (URL)",
+                }
 
             except Exception as e:
                 st.error(f"変換に失敗しました: {e}")
+                st.session_state.url_result = None
+
+        # --- 結果 ---
+        url_result = st.session_state.get("url_result")
+        if url_result:
+            st.write("")
+            with st.container(border=True):
+                st.markdown("##### 変換結果")
+                display_conversion(
+                    md_text=url_result["md_text"],
+                    filename=url_result["filename"],
+                    converter_label=url_result["converter_label"],
+                )
 
 # --------------------------------------------
 # 履歴タブ
