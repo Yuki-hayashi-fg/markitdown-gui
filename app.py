@@ -264,6 +264,27 @@ tab_convert, tab_history = st.tabs(["変換", "履歴"])
 # 変換タブ
 # --------------------------------------------
 with tab_convert:
+    # 対応フォーマット一覧（折りたたみ）
+    with st.expander("対応フォーマット詳細", expanded=False):
+        st.markdown(
+            """
+| カテゴリ | 対応形式 | 変換品質 |
+|---|---|---|
+| **Word (.docx)** | 見出し・リスト・太字などの構造を保持 | ◎ 高品質 |
+| **Excel (.xlsx / .xls / .csv)** | Markdownテーブルに変換 | ◎ 高品質 |
+| **PowerPoint (.pptx)** | スライドごとにテキスト抽出 | ○ 良好 |
+| **PDF** | テキスト抽出のみ。見出し・リスト等の書式は失われる | △ 限定的 |
+| **HTML** | Markdownに変換 | ○ 良好 |
+| **画像 (EXIF/OCR)** | メタデータ抽出。OCRやキャプション生成には外部LLMクライアントが必要 | △ 要LLM |
+| **音声** | 文字起こし。外部LLMクライアントが必要 | △ 要LLM |
+| **JSON / XML / CSV** | テキストベースなのでそのまま変換 | ○ 良好 |
+| **ZIP** | 中身を展開して個別に変換 | ○ 良好 |
+| **YouTube URL** | 字幕テキストを抽出 | ○ 良好 |
+
+> このアプリでは画像キャプションに `gpt-4o-mini`、音声・動画の文字起こしに `whisper-1` を使用しています。
+            """
+        )
+
     input_mode = st.radio(
         "入力方式を選択",
         ["ファイル", "URL（YouTube / Web）"],
@@ -272,10 +293,6 @@ with tab_convert:
 
     # ============ ファイルアップロード ============
     if input_mode == "ファイル":
-        st.markdown(
-            "**対応フォーマット**: Word / Excel / PowerPoint / PDF / HTML / "
-            "JSON / XML / CSV / ZIP / 画像 (OCR+キャプション) / 音声 / 動画"
-        )
         uploaded = st.file_uploader(
             "ファイルを選択",
             type=None,
@@ -328,9 +345,7 @@ with tab_convert:
 
     # ============ URL入力 ============
     else:
-        st.markdown(
-            "**対応URL例**: YouTube動画（字幕抽出）、Wikipediaなどの一般Webページ（HTML→Markdown）"
-        )
+        st.caption("YouTube動画（字幕抽出）、Wikipediaなどの一般Webページ（HTML→Markdown）")
         url = st.text_input(
             "URLを入力",
             placeholder="https://www.youtube.com/watch?v=... または https://example.com/...",
